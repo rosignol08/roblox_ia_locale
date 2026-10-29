@@ -1,0 +1,298 @@
+# MISSION (travail autonome de longue durée, pas de questions à l'utilisateur)
+
+Tu es un ingénieur senior Roblox/Luau + Python. Tu travailles seul pendant plusieurs heures.
+Ne me pose AUCUNE question : prends les décisions toi-même et note-les dans DECISIONS.md.
+À la fin, je dois retrouver un plugin Roblox Studio + un serveur Flask qui reproduisent
+l'expérience d'un assistant IA intégré à Studio : il a des YEUX (il lit le workspace, les
+scripts, les propriétés, les erreurs de la console) et des MAINS (il crée/modifie/supprime
+des objets, écrit des scripts, les injecte au bon endroit), avec des réponses bien formatées,
+complètes et copiables.
+
+Fichiers fournis : `OllamaAssistant.lua` (plugin, UI en français) et `server.py` (Flask → Ollama).
+L'interface reste en FRANÇAIS. Le modèle tourne en local via Ollama (ex. gemma, qwen, etc.),
+donc NE PAS supposer que le function-calling natif fonctionne : voir "Protocole d'outils".
+
+## CONTRAINTES DE TRAVAIL (très important)
+
+- Tu ne peux PAS lancer Roblox Studio. Donc : code défensif (pcall autour de toute API Studio
+  et de tout JSONDecode), pas d'API que tu n'es pas sûr d'exister (si doute → fallback + commentaire
+  `-- À VÉRIFIER dans la doc`), et pas de réécriture hasardeuse.
+- Isole la logique pure (découpage markdown, parsing JSON d'outils, sérialisation de valeurs,
+  parsing de chemins, validation) dans des fonctions sans dépendance Studio, et teste-les
+  hors Studio (Lune ou luau CLI si installable, sinon un harnais minimal ; pytest pour Python).
+  Analyse statique : `luau-analyze` / `selene` / `stylua` si disponibles, `python -m py_compile` + `ruff` pour Python.
+- Utilise git : un commit par fonctionnalité, messages clairs. Garde une sauvegarde `backup/` des originaux.
+- Ne casse jamais une fonctionnalité existante sans la remplacer par mieux. Avance par priorité
+  (P0 → P3). Termine chaque priorité complètement avant de passer à la suivante.
+- Limite Luau : max 200 variables `local` par portée. Le fichier est déjà gros : regroupe
+  l'état et les widgets UI dans des tables (`UI = {}`, `State = {}`), et organise le fichier en
+  sections commentées (CONFIG / UTILS / UI / CONTEXT / TOOLS / AGENT LOOP / EVENTS).
+- Reste en UN SEUL fichier plugin (installation simple dans le dossier Plugins) sauf si tu justifies
+  autre chose dans DECISIONS.md.
+- Livrables finaux : `OllamaAssistant.lua`, `server.py`, `README.md` (install, config, utilisation),
+  `CHANGELOG.md`, `DECISIONS.md`, `TESTS_MANUELS.md` (checklist pas-à-pas que je ferai demain dans
+  Studio, avec résultat attendu pour chaque ligne), `KNOWN_LIMITS.md`.
+
+## BUGS CONNUS À CORRIGER (P0)
+
+1. AFFICHAGE TRONQUÉ : un TextBox/TextLabel Roblox est limité à ~16 000 caractères ; un gros script
+   s'affiche coupé. Ne JAMAIS mettre une grosse réponse dans un seul élément. Découpe en plusieurs
+   éléments (≤ 8000 caractères, coupés aux sauts de ligne, ligne géante coupée aussi) dans un
+   ScrollingFrame + UIListLayout. Pour les blocs de code longs : affichage complet réparti en
+   morceaux ET bouton pour replier/déplier (aperçu 30 lignes par défaut, "Tout afficher").
+2. TEXTE NON COPIABLE : un TextLabel n'est pas sélectionnable et les plugins n'ont PAS d'accès au
+   presse-papier. Solutions à combiner :
+   - tout texte affiché utilise des TextBox `TextEditable=false`, `ClearTextOnFocus=false`
+     (sélectionnable à la souris, Ctrl+C fonctionne) ;
+   - chaque bloc de code a des boutons : "Sélectionner tout" (CaptureFocus + SelectionStart/CursorPosition),
+     "Injecter", "Ouvrir dans l'éditeur", "Copier via éditeur" (crée/ouvre un script temporaire
+     contenant le code pour faire Ctrl+A / Ctrl+C) ;
+   - n'appelle JAMAIS `StudioService:CopyToClipboard` (n'existe pas).
+3. INJECTION DANS LE SCRIPT EXISTANT : après une réponse contenant du code, proposer un bouton
+   d'injection qui cible correctement : script sélectionné → on l'écrase ; objet sélectionné
+   contenant exactement un script → on écrase celui-là ; plusieurs scripts → l'utilisateur choisit
+   dans une petite liste ; aucun → nouveau Script (type adapté : Script/LocalScript/ModuleScript
+   selon le contenu et la demande) au bon endroit (ServerScriptService, StarterPlayerScripts,
+   enfant de l'objet sélectionné…). Écriture via `ScriptEditorService:UpdateSourceAsync`
+   (fallback `.Source`). Avant injection : vérification syntaxique via `loadstring` SANS l'exécuter
+   (compile seulement), avertissement si le code semble tronqué, option "voir le diff" (lignes
+   ajoutées/supprimées). Toujours un waypoint ChangeHistory + bouton Annuler fiable.
+   Utiliser si possible `ChangeHistoryService:TryBeginRecording/FinishRecording`, sinon SetWaypoint.
+4. `extractCode` doit gérer : ```lua, ```luau, ``` seul, `\r\n`, bloc jamais refermé (réponse coupée),
+   plusieurs blocs (proposer chaque bloc séparément avec sa cible, pas seulement le plus gros).
+   Le modèle peut indiquer le fichier cible dans une ligne `-- FICHIER: game.ServerScriptService.X`
+   juste avant/dans le bloc : le parser doit l'utiliser.
+5. `getObjectFromPath` est définie APRÈS son premier usage (variable nil dans le handler
+   `provideContextButton`) : réorganiser pour que toutes les fonctions soient définies avant usage.
+   Réécrire la résolution de chemin pour supporter les noms contenant des points/espaces et les
+   doublons de noms (format de chemin non ambigu, ex. tableau JSON de segments, ou `game.Workspace["Mon Objet"]`,
+   avec suffixe d'index si doublon).
+6. Le code généré par `Instance.new("Script")` + `.Source = [[...]]` casse si le code contient `]]`.
+   Ne plus s'appuyer sur ça : voir outils `write_script` / `create_instance`.
+7. Serveur : `requests.post` sans timeout, `/api/cancel` ne stoppe pas réellement Ollama, `ollama_payload`
+   inutilisé, indentation mixte tabs/espaces, aucune option `num_ctx`/`num_predict` (→ réponses COUPÉES),
+   mémoire des tâches qui grossit sans fin, `print` du prompt entier. Corriger tout ça.
+
+## ARCHITECTURE CIBLE : AGENT À OUTILS (P1, cœur du projet)
+
+### Boucle d'agent
+Le plugin envoie la demande ; le modèle répond soit par du texte final, soit par UN appel d'outil ;
+le plugin exécute l'outil localement, renvoie le résultat au modèle ; on boucle (max 12 itérations,
+bouton Stop, compteur visible). Le serveur gère l'historique de conversation (liste de messages par
+`session_id`) et utilise `/api/chat` d'Ollama (pas `/api/generate`). Bouton "Nouvelle conversation".
+Historique persistant (plugin:SetSetting, taille limitée).
+
+### Protocole d'outils (robuste, indépendant du modèle)
+Le prompt système (côté serveur) décrit les outils et impose : pour appeler un outil, répondre par UN
+SEUL bloc ```json {"tool": "...", "args": {...}} ``` et RIEN d'autre ; pour répondre à l'utilisateur,
+texte normal. Le serveur/plugin parse de façon tolérante (JSON entouré de texte, guillemets typographiques,
+virgules traînantes, fences ```json ou non), détecte le function-calling natif d'Ollama si le modèle le
+supporte (`tools` dans /api/chat) mais ne dépend pas de lui. Si le JSON est invalide : renvoyer au modèle
+un message d'erreur précis et laisser 2 retries.
+
+### Outils à implémenter côté plugin (toutes les écritures sous waypoint + annulables)
+LECTURE (les yeux) :
+- `get_selection` : chemins, classes, propriétés clés des objets sélectionnés.
+- `get_tree` {root?, depth?, max_nodes?} : arborescence du workspace/services avec Nom, Classe,
+  nombre d'enfants, tronquée proprement (max ~300 nœuds, message "… N autres") ; défaut = vue
+  d'ensemble des services utiles (Workspace, ServerScriptService, ReplicatedStorage, StarterGui,
+  StarterPlayer, ServerStorage, Lighting, SoundService).
+- `find_instances` {name?, class?, root?, limit?} : recherche.
+- `get_properties` {path, names?} : propriétés lisibles (utiliser `ReflectionService` si disponible
+  sinon une liste curée par classe : BasePart, Model, Humanoid, Light, GuiObject, Sound, Attachment,
+  Script…), + Attributes + Tags (CollectionService). Sérialiser Vector3/Color3/CFrame/UDim2/EnumItem/
+  BrickColor/Instance-ref de façon réversible (voir "Sérialisation").
+- `read_script` {path, from_line?, to_line?} : source numérotée, avec pagination pour les gros scripts.
+- `search_code` {query, root?} : grep dans les Sources de tous les scripts (retourne chemin + n° de ligne + extrait).
+- `get_output` {last_n?} : dernières lignes de LogService (erreurs/warnings/prints), capturées en
+  continu via `LogService.MessageOut` dans un buffer circulaire (500 lignes).
+- `get_script_errors` : erreurs de syntaxe/analyse si accessibles (ScriptEditorService diagnostics, à vérifier).
+ÉCRITURE (les mains) :
+- `create_instance` {class, parent, name?, properties?} : propriétés en JSON typé ; vérifie que la
+  classe est créable (`pcall(Instance.new)`), que le parent existe, refuse les classes dangereuses
+  inutiles ; renvoie le chemin créé. Supporte la création en lot : `create_instances` [{...}] avec
+  hiérarchie imbriquée (children) pour construire des objets complexes (porte, flaque, tour, PNJ, GUI…)
+  en un seul appel.
+- `set_properties` {path, properties}, `set_attributes`, `add_tag`.
+- `delete_instance` {path} : demande une CONFIRMATION utilisateur (bouton dans l'UI) si > 1 objet ou
+  si c'est un script/modèle ; jamais de suppression de services ni de `game`.
+- `clone_instance`, `move_instance` (reparent), `group_as_model`.
+- `write_script` {path | parent+name+class, source, mode: "replace"|"create"|"append"|"patch"} :
+  écrit un script complet sans passer par du code exécuté. Mode "patch" = {search, replace} appliqué
+  de façon unique sur la source (évite de réécrire 800 lignes pour 3 lignes).
+  Avant écriture : compile-check, diff affiché, bouton Annuler.
+- `run_code` {code} : exécute du Luau dans le contexte plugin (loadstring) avec timeout non bloquant
+  (déjà présent : le conserver et l'améliorer), tracking des instances créées, capture des erreurs,
+  cap sur le nombre d'instances créées (ex. 2000) ; ce n'est qu'un échappatoire quand les outils
+  structurés ne suffisent pas. Utiliser un environnement avec `print` redirigé vers le buffer de sortie.
+- `insert_asset` {asset_id, parent?} via `InsertService:LoadAsset` (pcall, erreurs claires : asset
+  privé, ID invalide) ; ne PAS dépendre d'une recherche Toolbox (API non fiable) : si l'utilisateur
+  demande un objet sans ID, le construire à partir de primitives avec `create_instances`
+  (Part, WedgePart, Cylinder via Shape, UnionOperation interdit, MeshPart seulement si MeshId fourni).
+- `select_instances` {paths} et `focus_camera` {path} (si possible, via workspace.CurrentCamera / `Selection`).
+Chaque outil renvoie au modèle un résultat COURT et structuré (JSON compact), tronqué si > ~6000
+caractères avec indication de pagination.
+
+### Sérialisation de valeurs (module pur, testé)
+Format JSON typé, ex. : `{"Vector3":[1,2,3]}`, `{"Color3":[255,0,0]}` ou `"#FF0000"`,
+`{"CFrame":[x,y,z]}` ou position+rotation en degrés, `{"UDim2":[sx,ox,sy,oy]}`, `{"Enum":"Material.Neon"}`,
+`{"BrickColor":"Bright red"}`, `{"Instance":"<chemin>"}`, nombres/chaînes/booléens bruts. Fonctions
+`decodeValue(typeHint, json)` / `encodeValue(value)`. Types de propriété déduits par la valeur actuelle
+ou via reflection. Erreurs explicites ("Propriété X inexistante sur Part").
+
+### Contexte automatique (yeux par défaut)
+À chaque demande, le plugin joint un contexte COMPACT et budgété (limite en caractères configurable) :
+sélection (chemins + classes + sources des scripts sélectionnés, tronquées avec pagination), script
+ouvert dans l'éditeur, résumé du projet (arbre de scripts + nombre d'objets par service), dernières
+erreurs de la console. Le modèle utilise ensuite les outils pour creuser. Remplace l'ancien système
+`[LIRE_FICHIER: ...]` par l'outil `read_script` (appelé automatiquement, plus besoin du bouton
+"Fournir le fichier" — le retirer proprement).
+
+## SERVEUR PYTHON (P1)
+
+- Passer à `/api/chat` d'Ollama avec historique par `session_id` ; nouveaux endpoints :
+  `POST /api/agent` (message + session_id + model + mode), `GET /api/status/<id>`,
+  `POST /api/cancel/<id>` (annulation RÉELLE : streaming `stream=True` côté requests, boucle qui
+  vérifie le flag d'annulation et ferme la connexion), `POST /api/reset/<session_id>`,
+  `GET /api/models` (via Ollama `/api/tags`), `GET /api/health`.
+- Streaming : stocker le texte partiel dans la tâche (`partial`) pour que le plugin affiche la réponse
+  qui se construit pendant la génération (statut "en_cours" + partial).
+- Options Ollama configurables : `num_ctx` (défaut 16384, max selon modèle), `num_predict` (défaut
+  -1 ou 8192), `temperature` (0.2 pour code), `keep_alive`. Détecter `done_reason == "length"` et
+  renvoyer `truncated: true` ; le plugin propose alors "Continuer" (envoie "continue exactement où
+  tu t'es arrêté") et recolle les morceaux.
+- Nettoyage `<think>...</think>` conservé (et variantes), mais aussi retirer proprement les blocs
+  de raisonnement non fermés.
+- Prompts système par mode, réécrits et solides, en français, qui expliquent : l'environnement
+  (Roblox Studio, plugin), le protocole d'outils, les bonnes pratiques Luau (task.wait, pas de wait(),
+  RemoteEvents, FilterEnabled, éviter les boucles infinies sans yield), le format de réponse
+  (toujours des blocs ```lua complets avec `-- FICHIER:` cible ; pas de "// reste du code inchangé"
+  quand on remplace un script entier ; sinon utiliser `write_script` mode patch), et la règle
+  "ne jamais inventer un chemin : utilise get_tree/find_instances d'abord". Modes : Assistant,
+  Constructeur, Codeur Strict, Débogueur, Agent Autonome (planification puis exécution par outils).
+- Robustesse : timeouts (connexion 10 s, lecture longue configurable), gestion des erreurs Ollama
+  (modèle absent, Ollama éteint → message clair renvoyé au plugin), nettoyage des tâches > 1 h,
+  verrou thread-safe sur `memoire_taches`, logs concis (tronquer les prompts affichés), config via
+  variables d'environnement (OLLAMA_URL, PORT), `requirements.txt`.
+- Tests pytest avec Ollama mocké : création de tâche, statut, annulation, troncature, nettoyage think.
+
+## INTERFACE (P2)
+
+- Vraie vue "chat" : bulles utilisateur / assistant / résultats d'outils (repliables, ex. "🔧 get_tree
+  → 142 nœuds"), auto-scroll vers le bas, rendu markdown léger (titres, listes, `code inline`, blocs
+  de code avec en-tête langage + boutons), tout en TextBox sélectionnables.
+- Les actions de l'agent sont visibles et réversibles : liste "Actions effectuées" avec bouton
+  Annuler global (ChangeHistory) ; confirmation requise pour les actions destructrices.
+- Réglages persistants (plugin:SetSetting/GetSetting) : URL du serveur, modèle (liste depuis
+  /api/models), mode, budget de contexte, nombre max d'itérations, auto-exécution des outils
+  d'écriture (désactivée par défaut → bouton "Appliquer" sur chaque proposition) ; case
+  "Mode autonome" pour tout appliquer sans confirmation (sauf suppressions).
+- Indicateur de contexte (réécrire `contextIndicator` : sélection + script ouvert + taille estimée
+  en tokens), indicateur de connexion au serveur (health check au démarrage, messages clairs si
+  "Allow HTTP Requests" est désactivé ou si le serveur est injoignable).
+- Layout responsive (le widget peut être redimensionné ; utiliser UIListLayout/UIPadding plutôt que
+  des positions en pixels codées en dur) et thème sombre cohérent. Raccourci : Entrée = envoyer,
+  Maj+Entrée = nouvelle ligne si faisable.
+- Conserver et améliorer le mode "Agent Autonome" : plan → validation → exécution étape par étape
+  avec auto-correction (en cas d'échec, renvoyer l'erreur au modèle, max 3 essais) et vérification
+  finale via `get_output` + `get_tree`.
+
+## QUALITÉ / SÉCURITÉ (P2-P3)
+
+- Boucle d'auto-correction : après une écriture de script ou un run_code, lire la console pendant
+  ~2 s, et si erreur de syntaxe/exécution, la renvoyer au modèle automatiquement.
+- Garde-fous : jamais de `game:Destroy()`, pas de suppression de services, plafond sur le nombre
+  d'objets créés par appel, pas d'appels HTTP depuis le code généré sans demande explicite, aucun
+  envoi de données hors du réseau local (le serveur n'appelle que Ollama).
+- Journal des actions (table en mémoire + affichage) et export du journal dans un StringValue/Script
+  de notes si l'utilisateur le demande.
+- Performance : ne jamais parcourir `game:GetDescendants()` entier de façon répétée ; limiter, mettre
+  en cache avec invalidation sur DescendantAdded/Removing, utiliser task.wait() régulier dans les
+  longues boucles pour ne pas geler Studio.
+- Gérer les cas limites : script ouvert mais non sélectionné, sélection multiple, objets supprimés
+  entre-temps, scripts désactivés (Enabled=false) signalés mais lisibles, Studio en mode Play/Run.
+- Compatibilité : aucune API dépréciée (`wait`, `spawn`, `delay`, `Instance.new(class, parent)`),
+  utiliser `task.*`, `ScriptEditorService`, `Selection`, `ChangeHistoryService`.
+
+## ORDRE D'EXÉCUTION
+
+P0 : bugs 1→7 (affichage complet, copie/sélection, injection correcte, extractCode, ordre des
+     fonctions, serveur robuste avec num_ctx/num_predict/timeouts).
+P1 : boucle d'agent + protocole d'outils + outils de lecture (yeux) + outils d'écriture (mains) +
+     serveur /api/chat avec historique, streaming partiel, annulation réelle, détection de troncature.
+P2 : UI chat, réglages persistants, confirmations/annulation, contexte automatique, auto-correction.
+P3 : polish, docs, tests, TESTS_MANUELS.md, KNOWN_LIMITS.md.
+
+## JOURNAL DE BORD ET RAPPORT (obligatoire, à tenir EN PARALLÈLE du travail)
+
+Tu dois tenir deux fichiers à la racine du projet, mis à jour pendant tout le travail
+et pas seulement à la fin. Si tu t'arrêtes brutalement, je dois quand même pouvoir
+comprendre où tu en étais.
+
+### 1. `JOURNAL.md` (chronologique, en ajout uniquement)
+- Crée-le AVANT de toucher au code. Ne réécris jamais une entrée existante : ajoute à la fin.
+- Écris une entrée à chaque événement : début/fin d'une priorité (P0, P1…), chaque fonctionnalité
+  terminée, chaque bug trouvé ou corrigé, chaque test lancé (avec résultat), chaque décision
+  importante, chaque blocage ou échec, chaque retour en arrière.
+- Écris l'entrée de début AVANT de commencer la tâche ("Je vais faire X parce que Y"), puis
+  l'entrée de résultat APRÈS ("X terminé / échoué, voici ce qui s'est passé").
+- Format de chaque entrée :
+
+  ### [AAAA-MM-JJ HH:MM] [TYPE] Titre court
+  - **Quoi** : ce que tu as fait ou tenté
+  - **Pourquoi** : la raison
+  - **Résultat** : ✅ réussi / ⚠️ partiel / ❌ échoué (+ détail, message d'erreur exact si échec)
+  - **Fichiers touchés** : liste
+  - **Commit** : hash git si applicable
+  - **À vérifier dans Studio** : ce que l'utilisateur doit tester à la main (si pertinent)
+
+  TYPE parmi : PLAN, FEATURE, BUGFIX, TEST, DECISION, BLOCAGE, REFACTO, DOC, DOUTE.
+
+- Sois HONNÊTE : si tu n'es pas sûr qu'une API existe, si un test n'a pas pu tourner, si tu as
+  contourné un problème au lieu de le résoudre, écris-le (type DOUTE ou BLOCAGE). Ne marque jamais
+  ✅ ce que tu n'as pas vérifié. Distingue clairement "testé hors Studio" de "écrit mais non testé".
+- Ajoute une ligne "heartbeat" (`[HH:MM] en cours : <tâche>`) au moins toutes les 20 à 30 minutes
+  de travail, pour que je voie que tu étais encore actif et sur quoi.
+
+### 2. `RAPPORT_MATIN.md` (résumé vivant, réécrit à chaque jalon)
+C'est le premier fichier que je lirai. Réécris-le (remplace son contenu) à la fin de chaque
+priorité et à chaque changement d'état important. Il doit toujours tenir en une lecture de
+5 minutes et contenir, dans cet ordre :
+
+1. **État global** : une phrase + barre de progression P0/P1/P2/P3 (ex. `P0 ✅ | P1 ⚠️ 70% | P2 ❌ | P3 ❌`)
+2. **Ce qui fonctionne** : liste de ce qui est terminé, avec niveau de confiance
+   (🟢 testé hors Studio / 🟡 écrit mais non testé dans Studio / 🔴 incertain)
+3. **Ce qui ne fonctionne pas ou reste à faire** : liste honnête et priorisée
+4. **Problèmes rencontrés et comment ils ont été résolus ou contournés**
+5. **Décisions importantes que j'aurais pu prendre autrement** (avec la raison de ton choix)
+6. **Par où commencer demain** : étapes numérotées et exactes
+   (1. copier le plugin dans le dossier Plugins, 2. lancer `pip install -r requirements.txt` puis
+   `python server.py`, 3. activer Allow HTTP Requests, 4. dérouler `TESTS_MANUELS.md`…)
+7. **Si ça plante** : les 5 premiers endroits à regarder (Output de Studio, console du serveur,
+   `JOURNAL.md` à telle section…), et quelle information me renvoyer pour corriger vite
+8. **Chiffres** : nombre de commits, de tests passés/échoués, de lignes du plugin et du serveur
+
+### 3. Règles de tenue
+- Mets à jour `JOURNAL.md` et `RAPPORT_MATIN.md` AVANT chaque commit git, et inclus-les dans le commit.
+- En cas de doute sur la suite, écris d'abord dans le journal ce que tu hésites à faire et pourquoi,
+  puis tranche et continue (je ne suis pas là pour répondre).
+- Quand tu es bloqué plus de 30 minutes sur un point, note-le en BLOCAGE, contourne-le avec une
+  solution simple et signalée, puis passe à la suite au lieu de t'acharner.
+- Dernière action avant de t'arrêter : relis `RAPPORT_MATIN.md`, vérifie qu'il correspond à
+  l'état réel du code (pas de fonctionnalité annoncée mais absente), puis ajoute une entrée
+  finale "FIN DE SESSION" dans le journal avec l'heure.
+- Écris ces deux fichiers en français, dans un ton factuel, sans enthousiasme excessif.
+
+## DÉFINITION DE "TERMINÉ"
+
+- Une réponse de 30 000 caractères s'affiche en entier (en morceaux) et chaque bloc de code est
+  injectable/ouvrable/sélectionnable en un clic.
+- "Crée un PNJ archer avec un script de tir" → l'agent regarde le workspace, crée l'objet (outil
+  structuré), écrit le script au bon endroit, vérifie la console, corrige si erreur.
+- "Modifie le script de l'archer pour qu'il vise plus vite" → l'agent lit le script, propose un patch
+  ciblé, montre le diff, l'applique sur confirmation, annulable en un clic.
+- "Que contient mon workspace ?" → résumé correct basé sur get_tree.
+- Tous les tests hors-Studio passent ; le code passe l'analyse statique ; TESTS_MANUELS.md est complet.
+- Aucune fonctionnalité d'origine perdue ; CHANGELOG.md liste tout ce qui a changé.
+
+Commence par lire intégralement les deux fichiers, écris un court plan dans DECISIONS.md, puis exécute P0.
