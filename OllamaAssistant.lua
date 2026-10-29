@@ -3,6 +3,7 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local Selection = game:GetService("Selection")
+local ClipboardService = game:GetService("ClipboardService")
 
 local AGENT_URL = "http://192.168.1.91:5000/api/agent"
 local lastGeneratedCode = nil
@@ -123,7 +124,6 @@ outputScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 outputScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 
 local MAX_CHUNK = 8000      -- bien sous la limite de ~16 000 caractères
-local PREVIEW_LINES = 30
 
 -- Découpe une réponse en segments texte / code (gère aussi un ``` jamais fermé)
 local function splitSegments(text)
@@ -202,37 +202,49 @@ local function afficherReponse(texte)
 		if seg.kind == "text" then
 			if string.match(seg.body, "%S") then addTextChunked(seg.body, false) end
 		else
-			-- Aperçu du code seulement : le code COMPLET est injecté via le bouton
-			local lines = string.split(seg.body, "\n")
-			local preview = {}
-			for i = 1, math.min(#lines, PREVIEW_LINES) do
-				table.insert(preview, string.sub(lines[i], 1, 200))
-			end
-			local msg = table.concat(preview, "\n")
-			if #lines > PREVIEW_LINES then
-				msg ..= "\n… (" .. #lines .. " lignes, " .. #seg.body .. " caractères au total)"
-			end
+			-- Affichage COMPLET du code dans le TextBox (copiable via sélection souris)
+			addTextChunked(seg.body, true)
 			if seg.truncated then
-				msg ..= "\n⚠️ Réponse coupée par le modèle : le code est peut-être incomplet."
+				addBox("\n⚠️ Réponse coupée par le modèle : le code est peut-être incomplet.", true)
 			end
-			addBox(msg, true)
 		end
 	end
 end
 
--- 2. Création du bouton de copie (placé juste au-dessus de la zone de texte, à droite)
-local copyButton = Instance.new("TextButton", frame)
-copyButton.Size, copyButton.Position = UDim2.new(0, 130, 0, 25), UDim2.new(1, -140, 0, 205) 
-copyButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-copyButton.TextColor3 = Color3.new(1, 1, 1)
-copyButton.Font = Enum.Font.SourceSansBold
-copyButton.Text = "📋 Copier la réponse"
-copyButton.Visible = true
+-- Bouton "Copier le code" : copie lastGeneratedCode dans le presse-papier
+local copyCodeButton = Instance.new("TextButton", frame)
+copyCodeButton.Size, copyCodeButton.Position = UDim2.new(0, 130, 0, 25), UDim2.new(1, -140, 0, 205)
+copyCodeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+copyCodeButton.TextColor3 = Color3.new(1, 1, 1)
+copyCodeButton.Font = Enum.Font.SourceSansBold
+copyCodeButton.Text = "📋 Copier le code"
+copyCodeButton.Visible = true
 
--- 3. Action du bouton : copie dans le presse-papier de ton ordinateur
-copyButton.Text = "📂 Ouvrir le script"
+copyCodeButton.MouseButton1Click:Connect(function()
+	if lastGeneratedCode and lastGeneratedCode ~= "" then
+		local ok, err = pcall(function()
+			ClipboardService:SetContents(lastGeneratedCode)
+		end)
+		if ok then
+			statusLabel.Text = "✅ Code copié dans le presse-papier !"
+		else
+			statusLabel.Text = "❌ Erreur copie : " .. tostring(err)
+		end
+	else
+		statusLabel.Text = "Aucun code à copier pour l'instant."
+	end
+end)
 
-copyButton.MouseButton1Click:Connect(function()
+-- Bouton "Ouvrir le script" : ouvre le dernier script injecté dans l'éditeur
+local openScriptButton = Instance.new("TextButton", frame)
+openScriptButton.Size, openScriptButton.Position = UDim2.new(0, 130, 0, 25), UDim2.new(1, -280, 0, 205)
+openScriptButton.BackgroundColor3 = Color3.fromRGB(50, 80, 120)
+openScriptButton.TextColor3 = Color3.new(1, 1, 1)
+openScriptButton.Font = Enum.Font.SourceSansBold
+openScriptButton.Text = "📂 Ouvrir le script"
+openScriptButton.Visible = true
+
+openScriptButton.MouseButton1Click:Connect(function()
 	if lastInjected and lastInjected.Parent then
 		task.spawn(function()
 			pcall(function() ScriptEditorService:OpenScriptDocumentAsync(lastInjected) end)
@@ -241,12 +253,13 @@ copyButton.MouseButton1Click:Connect(function()
 		statusLabel.Text = "Aucun script injecté pour l'instant."
 	end
 end)
+
 -- Création de l'indicateur visuel
 local contextIndicator = Instance.new("TextLabel", frame)
 contextIndicator.Size = UDim2.new(1, -20, 0, 20)
-contextIndicator.Position = UDim2.new(0, 10, 0, 85) -- Ajuste la position Y selon ton interface
+contextIndicator.Position = UDim2.new(0, 10, 0, 85)
 contextIndicator.BackgroundTransparency = 1
-contextIndicator.TextColor3 = Color3.fromRGB(150, 150, 255) -- Bleu clair pour se démarquer
+contextIndicator.TextColor3 = Color3.fromRGB(150, 150, 255)
 contextIndicator.TextXAlignment = Enum.TextXAlignment.Left
 contextIndicator.Font = Enum.Font.SourceSansItalic
 contextIndicator.Text = "📎 Contexte : Aucun script sélectionné"
@@ -269,14 +282,9 @@ end)
 -- ======================================================
 -- NOUVEAU : Exécution non bloquante + tracking des nouvelles instances
 -- ======================================================
--- Au bout de RUN_TIMEOUT_SECONDS, si le code tourne encore (boucle infinie,
--- task.wait long...), le plugin arrête d'attendre et rend la main. Le code
--- continue de s'exécuter tout seul en arrière-plan ; on ne peut pas le "tuer"
--- depuis un plugin, seulement arrêter d'attendre dessus.
 local RUN_TIMEOUT_SECONDS = 5
 local POLL_INTERVAL = 0.1
 
--- callback(success: bool, errMsg: string?, newInstances: {Instance}, timedOut: bool)
 local function executeGeneratedCode(code, callback)
 	local func, compileErr = loadstring(code)
 	if not func then
@@ -284,7 +292,6 @@ local function executeGeneratedCode(code, callback)
 		return
 	end
 
-	-- Tracking des objets créés pendant l'exécution
 	local newInstances = {}
 	local seen = {}
 	local trackingConn
@@ -300,8 +307,6 @@ local function executeGeneratedCode(code, callback)
 	local finished = false
 	local runSuccess, runErr = true, nil
 
-	-- Thread séparé : une boucle infinie ou un task.wait() dans le code généré
-	-- ne bloque plus l'interface du plugin.
 	task.spawn(function()
 		local ok, err = pcall(func)
 		runSuccess, runErr = ok, err
@@ -314,9 +319,6 @@ local function executeGeneratedCode(code, callback)
 		elapsed += POLL_INTERVAL
 	end
 
-	-- On arrête le tracking ici : les objets créés après ce point (dans un code
-	-- qui tourne toujours en arrière-plan après le timeout) ne seront pas
-	-- remontés, pour éviter de laisser le listener connecté indéfiniment.
 	trackingConn:Disconnect()
 
 	if finished then
@@ -327,30 +329,23 @@ local function executeGeneratedCode(code, callback)
 			callback(false, tostring(runErr), newInstances, false)
 		end
 	else
-		-- Timeout : on considère que le lancement a réussi (le code continue
-		-- de tourner tout seul), mais on prévient l'utilisateur.
 		ChangeHistoryService:SetWaypoint("Apres Execution IA (arrière-plan)")
 		callback(true, "timeout_background", newInstances, true)
 	end
 end
 
-
 local function getObjectFromPath(path)
-	-- Nettoie le "game." au début si l'IA l'a mis
 	local cleanPath = string.gsub(path, "^game%.", "")
 	local parts = string.split(cleanPath, ".")
 	
 	local current = game
 	for _, partName in ipairs(parts) do
-		-- Cherche l'enfant à chaque étape du chemin
 		current = current:FindFirstChild(partName)
 		if not current then return nil end
 	end
 	return current
 end
 
--- Sélectionne dans l'explorateur les instances passées, en filtrant celles
--- qui auraient déjà été détruites entre temps.
 local function highlightInstances(instances)
 	local valid = {}
 	for _, inst in ipairs(instances) do
@@ -370,7 +365,7 @@ local function writeSource(inst, code)
 	if not ok then inst.Source = code end
 end
 
--- Détermine où le code va aller
+-- Détermine où le code va aller : privilégie les scripts existants sélectionnés
 local function resolveTargets()
 	local targets = {}
 	local selected = Selection:Get()
@@ -387,7 +382,7 @@ local function resolveTargets()
 				if d:IsA("LuaSourceContainer") then table.insert(found, d) end
 			end
 			if #found == 1 then
-				table.insert(targets, {existing = found[1]})   -- le script de l'archer
+				table.insert(targets, {existing = found[1]})
 			else
 				table.insert(targets, {parent = item, name = "Ollama_Script"})
 			end
@@ -428,62 +423,6 @@ end
 -- ======================================================
 -- Exécution Simple et Annulation (Modes classiques)
 -- ======================================================
---executeButton.MouseButton1Click:Connect(function()
---	if not lastGeneratedCode or lastGeneratedCode == "" then return end
---	
---	local selectedItems = game:GetService("Selection"):Get()
---	local instancesToSelect = {} -- Pour mémoriser les scripts modifiés
---	
---	ChangeHistoryService:SetWaypoint("Avant Injection Code Ollama")
---	
---	if #selectedItems > 0 then
---		for _, item in ipairs(selectedItems) do
---			if item:IsA("LuaSourceContainer") then
---				-- CAS 1 : Tu as sélectionné un script directement
---				item.Source = lastGeneratedCode
---				table.insert(instancesToSelect, item)
---			else
---				-- CAS 2 : Tu as sélectionné le NPC/Modèle
---				-- On cherche s'il y a DÉJÀ des scripts dedans
---				local existingScripts = {}
---				for _, child in ipairs(item:GetChildren()) do
---					if child:IsA("LuaSourceContainer") then
---						table.insert(existingScripts, child)
---					end
---				end
---				
---				if #existingScripts == 1 then
---					-- S'il n'y a qu'un seul script dans le NPC, on écrase celui-là !
---					existingScripts[1].Source = lastGeneratedCode
---					table.insert(instancesToSelect, existingScripts[1])
---				else
---					-- S'il n'y en a pas (ou plusieurs), on en crée un nouveau proprement
---					local newScript = Instance.new("Script")
---					newScript.Name = "Ollama_ArcherAI" -- Un nom plus clair
---					newScript.Source = lastGeneratedCode
---					newScript.Parent = item
---					table.insert(instancesToSelect, newScript)
---				end
---			end
---		end
---		statusLabel.Text = "✅ Code injecté !"
---	else
---		-- CAS 3 : Rien n'est sélectionné
---		local newScript = Instance.new("Script")
---		newScript.Name = "OllamaGeneratedScript"
---		newScript.Source = lastGeneratedCode
---		newScript.Parent = game.Workspace
---		table.insert(instancesToSelect, newScript)
---		statusLabel.Text = "✅ Nouveau script créé dans Workspace !"
---	end
---	
---	-- LA MAGIE : On force l'explorateur à sélectionner et surligner le(s) script(s) modifié(s) !
---	game:GetService("Selection"):Set(instancesToSelect)
---	
---	ChangeHistoryService:SetWaypoint("Apres Injection Code Ollama")
---	executeButton.Visible = false
---end)
-
 executeButton.TextTruncate = Enum.TextTruncate.AtEnd
 
 executeButton.MouseButton1Click:Connect(function()
@@ -492,7 +431,6 @@ executeButton.MouseButton1Click:Connect(function()
 	statusLabel.Text = "✅ Code injecté dans " .. #touched .. " script(s) !"
 	executeButton.Visible = false
 	undoButton.Visible = true
-	copyButton.Text = "📂 Ouvrir le script"
 end)
 
 undoButton.MouseButton1Click:Connect(function()
@@ -550,7 +488,6 @@ local function extractCode(text)
 			best, bestTruncated = seg.body, seg.truncated
 		end
 	end
-	-- Pas de balises du tout mais ça ressemble à du Luau : on prend tout
 	if not best and (string.find(text, "game:GetService") or string.find(text, "local %w+ =")) then
 		best = text
 	end
@@ -600,7 +537,6 @@ local function getSelectionContext()
 end
 
 local function getProjectMap()
-	-- On cible uniquement les endroits où l'on range du code normalement
 	local servicesToScan = {
 		game:GetService("ServerScriptService"),
 		game:GetService("ReplicatedStorage"),
@@ -615,9 +551,7 @@ local function getProjectMap()
 		local ok, descendants = pcall(function() return service:GetDescendants() end)
 		if ok then
 			for _, obj in ipairs(descendants) do
-				-- Si c'est un script, un LocalScript ou un ModuleScript
 				if obj:IsA("LuaSourceContainer") then
-					-- Si c'est un script classique, on vérifie qu'il est bien activé
 					local isActive = true
 					if obj:IsA("BaseScript") then
 						isActive = obj.Enabled
@@ -647,7 +581,6 @@ local function askAgent(userPrompt, modelName, modeName)
 	
 	local projectMap = ""
 	
-	-- NOUVEAU : On ne charge la carte QUE si on n'a pas de script ET qu'on n'est PAS en mode "Constructeur" (Étape de code)
 	if not hasScriptInContext and modeName ~= "Constructeur" then
 		projectMap = getProjectMap()
 	end
@@ -712,7 +645,7 @@ local function askAgent(userPrompt, modelName, modeName)
 end
 
 -- ======================================================
--- Phase 2 : Exécution d'une sous-étape (utilise maintenant executeGeneratedCode)
+-- Phase 2 : Exécution d'une sous-étape
 -- ======================================================
 local function runStep(stepIndex)
 	local stepDescription = planSteps[stepIndex]
@@ -747,17 +680,13 @@ local function runStep(stepIndex)
 			local demandedFile = string.match(textRes, "%[LIRE_FICHIER:%s*(.-)%]")
 
 			if demandedFile then
-				-- CAS 1 : L'IA veut lire un script
 				afficherReponse("L'IA a besoin de lire :\n" .. demandedFile)
 				statusLabel.Text = "Action requise."
 				fileToFetch = demandedFile
 				provideContextButton.Text = "Fournir " .. demandedFile:match("([^%.]+)$") .. " et relancer"
 				provideContextButton.Visible = true
 				executeButton.Visible = false
-
-				-- On sort de la boucle d'essais pour te laisser le temps de cliquer sur le bouton
 				break 
-
 			elseif ok then
 				lastFullResponse = textRes
 				local code = extractCode(textRes)
@@ -861,15 +790,12 @@ sendButton.MouseButton1Click:Connect(function()
 				end
 			end
 		else
-            -- MODE CLASSIQUE (Assistant, Débogueur, Codeur)
             local ok, textRes = askAgent(prompt, model, mode)
             
             if ok and not isCancelled then
-                -- On cherche la balise spéciale
                 local demandedFile = string.match(textRes, "%[LIRE_FICHIER:%s*(.-)%]")
                 
                 if demandedFile then
-                    -- L'IA demande un fichier
                     afficherReponse("L'IA a besoin de lire :\n" .. demandedFile)
                     statusLabel.Text = "Action requise."
                     fileToFetch = demandedFile
@@ -877,7 +803,6 @@ sendButton.MouseButton1Click:Connect(function()
                     provideContextButton.Visible = true
                     executeButton.Visible = false
                 else
-					-- Réponse classique (Ni erreur, ni demande de fichier)
 					lastFullResponse = textRes
 					afficherReponse(textRes)
 					statusLabel.Text = "Réponse reçue."
@@ -892,7 +817,6 @@ sendButton.MouseButton1Click:Connect(function()
 					end
 				end
             elseif not ok and not isCancelled then
-                -- Affichage des erreurs réseau/Python
                 afficherReponse("Erreur :\n" .. tostring(textRes))
                 statusLabel.Text = "Échec."
             end
@@ -905,10 +829,4 @@ sendButton.MouseButton1Click:Connect(function()
 end)
 
 btnNextStep.MouseButton1Click:Connect(function() runStep(activeStepIndex) end)
-btnRetryStep.MouseButton1Click:Connect(function()
-	local stepToRetry = activeStepIndex
-	if activeStepIndex > 1 and not btnNextStep.Visible then stepToRetry = activeStepIndex - 1 end
-	runStep(stepToRetry)
-end)
-
-button.Click:Connect(function() widget.Enabled = not widget.Enabled end)
+btnRetryStep.MouseButton1Click:
